@@ -9,13 +9,12 @@
 #include <CMMC_BootMode.h>
 #include "data_type.h"
 
-u8 currentSleepTimeMinuteByte = 60; 
+u8 isCrashed = 0; 
 #include <SoftwareSerial.h>
 #define rxPin 14
 #define txPin 12
 
-bool serialBusy = false;
-bool dirty = false;
+bool shouldSendPacketOverESPNowBack = false;
 
 // SoftwareSerial swSerial(rxPin, txPin, false, 128);
 SoftwareSerial swSerial(rxPin, txPin);
@@ -25,13 +24,14 @@ SoftwareSerial swSerial(rxPin, txPin);
 #define PROD_MODE_PIN         13
 
 int mode;
+bool isIgnoreNewMessage = 0;
 
 CMMC_SimplePair instance;
 CMMC_ESPNow espNow;
 CMMC_Utils utils;
 CMMC_LED led(LED_PIN, LOW);
 
-uint8_t mmm[6];
+uint8_t targetMacAddr[6];
 
 void evt_callback(u8 status, u8* sa, const u8* data) {
   if (status == 0) {
@@ -40,7 +40,6 @@ void evt_callback(u8 status, u8* sa, const u8* data) {
     utils.dump(data, 16);
     Serial.printf("WITH MAC: ");
     utils.dump(sa, 6);
-    led.high();
     ESP.reset();
   }
   else {
@@ -79,22 +78,6 @@ void setup()
 {
   setup_hardware();
   Serial.println("Controller Mode");
-  parser.on_command_arrived([](CMMC_SERIAL_PACKET_T * packet, size_t len) {
-    Serial.printf("ON_PARSER at (%lums)", millis());
-    Serial.printf("CMD->0x%2x\r\n", packet->cmd);
-    Serial.printf("LEN->%lu\r\n", packet->len);
-    CMMC::dump((u8*)packet->data, 4);
-    CMMC::dump((u8*)packet->data+4, 4);
-    Serial.printf("HEAP = %lu\r\n", ESP.getFreeHeap());
-    if (packet->cmd == CMMC_SLEEP_TIME_CMD) {
-      memcpy(&time, packet->data, 4);
-      currentSleepTimeMinuteByte = time; 
-      if (time > 255) {
-        currentSleepTimeMinuteByte = 254;
-      }
-    }
-  });
-
   pinMode(PROD_MODE_PIN, INPUT_PULLUP); 
   uint32_t wait_config = 1000;
   if (digitalRead(PROD_MODE_PIN) == LOW) {
@@ -109,32 +92,24 @@ void setup()
       start_config_mode();
     }
     else if (mode == BootMode::MODE_RUN) {
-      led.high();
       Serial.print("Initializing... Controller..");
       espNow.init(NOW_MODE_CONTROLLER);
       espNow.on_message_recv([](uint8_t *macaddr, uint8_t *data, uint8_t len) {
         Serial.print("FROM: ");
         CMMC::dump(macaddr, 6); 
-        memcpy(mmm, macaddr, 6);
-        dirty = true;
-        serialBusy = true;
-        led.toggle(); 
-        static CMMC_PACKET_T wrapped; 
-        static CMMC_SENSOR_DATA_T packet;
-        memcpy(&packet, data, sizeof(packet)); 
-        memcpy(&wrapped.data, &packet, sizeof(packet));
-        wrapped.ms = millis(); 
-        wrapped.sleepTime = currentSleepTimeMinuteByte;
-        wrapped.sum = CMMC::checksum((uint8_t*) &wrapped, sizeof(wrapped) - sizeof(wrapped.sum));
-        Serial.printf("sizeof wrapped packet = %d\r\n", sizeof(wrapped));
-        // Serial.write((byte*)&wrapped, sizeof(wrapped));
-        CMMC_Utils::dump((u8*)&wrapped, sizeof(wrapped));
-        Serial.println(swSerial.write((byte*)&wrapped, sizeof(wrapped)));
+        memcpy(targetMacAddr, macaddr, 6);
+        if (data[0] && !isIgnoreNewMessage) {
+          isCrashed = data[0];
+          led.low();
+        }
+        else {
+          led.high(); 
+        }
+        shouldSendPacketOverESPNowBack = true; 
       });
 
       espNow.on_message_sent([](uint8_t *macaddr,  uint8_t status) {
-        serialBusy = false;
-        dirty = false;
+        shouldSendPacketOverESPNowBack = false;
       });
     }
     else {
@@ -156,14 +131,19 @@ void loop()
     Serial.println("Simple Pair Wait timeout.");
     ESP.reset();
   }
-  if (serialBusy == false) {
-    parser.process();
-    delay(1);
+
+  parser.process();
+  delay(1);
+  if (isCrashed) {
+    led.low();
+  }
+  else {
+    led.high(); 
   }
 
-  while (dirty) {
-    Serial.printf("SENT SLEEP_TIME BACK = %u MINUTE\r\n", currentSleepTimeMinuteByte);
-    espNow.send(mmm, &currentSleepTimeMinuteByte, 1);
+  while (shouldSendPacketOverESPNowBack) {
+    Serial.printf("SENT BYTE = %u \r\n", isCrashed);
+    espNow.send(targetMacAddr, &isCrashed, 1);
     delay(1);
   }
 
@@ -172,5 +152,18 @@ void loop()
     if (ct.is_timeout()) {
       ESP.reset();
     }
+    isCrashed = 0;
+    led.high();
+    uint32_t nextIgnoreMessage = millis() + 30*1000L;
+    isIgnoreNewMessage = 1; 
+    while(millis() < nextIgnoreMessage) {
+      yield();
+      while (shouldSendPacketOverESPNowBack) {
+        Serial.printf("SENT BYTE = %u \r\n", isCrashed);
+        espNow.send(targetMacAddr, &isCrashed, 1);
+        delay(1);
+      }
+    }
+    isIgnoreNewMessage = 0; 
   }
 }
